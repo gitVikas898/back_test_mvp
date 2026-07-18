@@ -3,16 +3,69 @@ backtest.py  –  Pure business logic for ArthaPulse.
 No Streamlit imports here; fully testable in isolation.
 """
 from __future__ import annotations
- 
+
+import time
+from urllib.error import HTTPError, URLError
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
- 
- 
+
+
 # ──────────────────────────────────────────────
 # Data helpers
 # ──────────────────────────────────────────────
- 
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Return True for transient network/data-service failures."""
+    if isinstance(exc, (HTTPError, URLError, TimeoutError, ConnectionError)):
+        return True
+
+    text = str(exc).lower()
+    return any(token in text for token in (
+        "service unavailable",
+        "temporarily unavailable",
+        "too many requests",
+        "rate limit",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+    ))
+
+
+def _download_with_retries(
+    download_func,
+    symbol: str,
+    *,
+    max_retries: int = 3,
+    delay_seconds: float = 2.0,
+    warn_callback=None,
+):
+    """Retry transient download failures a few times before giving up."""
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return download_func()
+        except Exception as exc:  # pragma: no cover - exercised by tests
+            last_error = exc
+            if not _is_retryable_error(exc) or attempt >= max_retries:
+                raise
+
+            retry_delay = delay_seconds * attempt
+            if warn_callback:
+                warn_callback(
+                    f"{symbol} temporarily unavailable ({exc}). Retrying {attempt}/{max_retries} in {retry_delay:.0f}s..."
+                )
+            time.sleep(retry_delay)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Download failed without an error")
+
+
 def download_stock_data(
     tickers: list[str],
     start_date,
@@ -33,9 +86,17 @@ def download_stock_data(
     for t in tickers:
         try:
             symbol = f"{t}.NS"
-            data = yf.download(
-                symbol, start=start_date, end=end_date,
-                progress=False, auto_adjust=True,
+            data = _download_with_retries(
+                lambda: yf.download(
+                    symbol,
+                    start=start_date,
+                    end=end_date,
+                    progress=False,
+                    auto_adjust=True,
+                    timeout=30,
+                ),
+                symbol,
+                warn_callback=warn_callback,
             )
             if data.empty:
                 failed.append(t)
@@ -66,9 +127,16 @@ def download_stock_data(
  
 def download_nifty50(start_date, end_date) -> pd.Series:
     """Download Nifty 50, return a clean float Series."""
-    data = yf.download(
-        "^NSEI", start=start_date, end=end_date,
-        progress=False, auto_adjust=True,
+    data = _download_with_retries(
+        lambda: yf.download(
+            "^NSEI",
+            start=start_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=True,
+            timeout=30,
+        ),
+        "NIFTY50",
     )
     if data.empty:
         return pd.Series(dtype=float)
